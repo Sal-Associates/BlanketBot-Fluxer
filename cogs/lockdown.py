@@ -1,147 +1,121 @@
-import discord
-from discord.ext import commands
+import fluxer
+from fluxer import Embed, Permissions
+
 import db
-from checks import administrator_check
+from cogs.mod_log import Target, record_action
+from framework import BlanketCog, ChannelArg, command
+from utils import BLURPLE
 
 
-class Lockdown(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
+class Lockdown(BlanketCog):
 
-    @commands.group(name="lockdown", invoke_without_command=True)
-    @administrator_check()
+    def _channel_ids(self, guild_id: int) -> list[int]:
+        with db.get_db() as conn:
+            rows = conn.execute("SELECT channel_id FROM lockdown_channels WHERE guild_id = ?", (guild_id,)).fetchall()
+        return [r["channel_id"] for r in rows]
+
+    async def _guild_target(self, ctx) -> Target:
+        guild = ctx.guild
+        return Target("guild", ctx.guild_id, guild.name if guild else str(ctx.guild_id))
+
+    @command("lockdown", level="admin")
     async def lockdown(self, ctx):
         await ctx.send("❌ Usage: `?lockdown enable|disable|status|channel`")
 
-    @lockdown.command(name="enable")
-    @administrator_check()
+    @command("lockdown enable", level="admin")
     async def lockdown_enable(self, ctx, *, reason: str = ""):
-        with db.get_db() as conn:
-            channels = conn.execute(
-                "SELECT channel_id FROM lockdown_channels WHERE guild_id = ?", (ctx.guild.id,)
-            ).fetchall()
-        if not channels:
+        ids = self._channel_ids(ctx.guild_id)
+        if not ids:
             await ctx.send("❌ No lockdown channels configured. Use `?lockdown channel add #channel` first.")
             return
-        if not ctx.guild.me.guild_permissions.manage_channels:
+        bot_member = await self.bot.me(ctx.guild_id)
+        if not await self.bot.perms(ctx.guild_id, bot_member) & Permissions.MANAGE_CHANNELS:
             await ctx.send("❌ I need **Manage Channels** permission to lock channels.")
             return
 
-        everyone = ctx.guild.default_role
+        existing = await self.bot.guild_channels(ctx.guild_id)
         locked, failed = [], []
-        for row in channels:
-            channel = ctx.guild.get_channel(row["channel_id"])
-            if not channel:
+        for cid in ids:
+            if cid not in existing:
                 continue
-            overwrite = channel.overwrites_for(everyone)
-            db.save_permission_snapshot(ctx.guild.id, channel.id, "lockdown", overwrite.send_messages)
+            previous = await self.bot.get_perm_state(cid, ctx.guild_id, Permissions.SEND_MESSAGES)
+            db.save_permission_snapshot(ctx.guild_id, cid, "lockdown", previous)
             try:
-                await channel.set_permissions(everyone, send_messages=False, reason=f"Lockdown: {reason or 'No reason'}")
-                locked.append(channel.mention)
-            except discord.HTTPException:
-                failed.append(channel.mention)
+                await self.bot.set_perm_state(cid, ctx.guild_id, {Permissions.SEND_MESSAGES: False})
+                locked.append(f"<#{cid}>")
+            except fluxer.HTTPException:
+                failed.append(f"<#{cid}>")
 
-        self.bot.dispatch("mod_action", "lockdown_enable", ctx.author, ctx.guild, reason or None, ctx.guild)
+        await record_action(self.bot, ctx.guild_id, "lockdown_enable", ctx.author, await self._guild_target(ctx), reason or None)
         msg = f"🔒 Server locked. Channels: {', '.join(locked) or 'none'}"
         if failed:
             msg += f"\n⚠️ Failed: {', '.join(failed)}"
         await ctx.send(msg)
 
-    @lockdown.command(name="disable")
-    @administrator_check()
+    @command("lockdown disable", level="admin")
     async def lockdown_disable(self, ctx, *, reason: str = ""):
-        with db.get_db() as conn:
-            channels = conn.execute(
-                "SELECT channel_id FROM lockdown_channels WHERE guild_id = ?", (ctx.guild.id,)
-            ).fetchall()
-        if not channels:
+        ids = self._channel_ids(ctx.guild_id)
+        if not ids:
             await ctx.send("❌ No lockdown channels configured.")
             return
 
-        everyone = ctx.guild.default_role
+        existing = await self.bot.guild_channels(ctx.guild_id)
         unlocked, failed = [], []
-        for row in channels:
-            channel = ctx.guild.get_channel(row["channel_id"])
-            if not channel:
+        for cid in ids:
+            if cid not in existing:
                 continue
-            restore = db.pop_permission_snapshot(ctx.guild.id, channel.id, "lockdown")
+            restore = db.pop_permission_snapshot(ctx.guild_id, cid, "lockdown")
             try:
-                await channel.set_permissions(everyone, send_messages=restore, reason=f"Lockdown lifted: {reason or 'No reason'}")
-                unlocked.append(channel.mention)
-            except discord.HTTPException:
-                failed.append(channel.mention)
+                await self.bot.set_perm_state(cid, ctx.guild_id, {Permissions.SEND_MESSAGES: restore})
+                unlocked.append(f"<#{cid}>")
+            except fluxer.HTTPException:
+                failed.append(f"<#{cid}>")
 
-        self.bot.dispatch("mod_action", "lockdown_disable", ctx.author, ctx.guild, reason or None, ctx.guild)
+        await record_action(self.bot, ctx.guild_id, "lockdown_disable", ctx.author, await self._guild_target(ctx), reason or None)
         msg = f"🔓 Server unlocked. Channels: {', '.join(unlocked) or 'none'}"
         if failed:
             msg += f"\n⚠️ Failed: {', '.join(failed)}"
         await ctx.send(msg)
 
-    @lockdown.command(name="status")
-    @administrator_check()
+    @command("lockdown status", level="admin")
     async def lockdown_status(self, ctx):
-        with db.get_db() as conn:
-            rows = conn.execute(
-                "SELECT channel_id FROM lockdown_channels WHERE guild_id = ?", (ctx.guild.id,)
-            ).fetchall()
-        if not rows:
+        ids = self._channel_ids(ctx.guild_id)
+        if not ids:
             await ctx.send("No lockdown channels configured. Use `?lockdown channel add #channel`.")
             return
-        everyone = ctx.guild.default_role
+        existing = await self.bot.guild_channels(ctx.guild_id)
         lines = []
-        for row in rows:
-            channel = ctx.guild.get_channel(row["channel_id"])
-            if not channel:
-                lines.append(f"~~{row['channel_id']}~~ (deleted)")
+        for cid in ids:
+            if cid not in existing:
+                lines.append(f"~~{cid}~~ (deleted)")
                 continue
-            overwrite = channel.overwrites_for(everyone)
-            status = "🔒 Locked" if overwrite.send_messages is False else "🔓 Open"
-            lines.append(f"{status} {channel.mention}")
-        embed = discord.Embed(title="Lockdown Status", description="\n".join(lines), color=discord.Color.blurple())
-        await ctx.send(embed=embed)
+            state = await self.bot.get_perm_state(cid, ctx.guild_id, Permissions.SEND_MESSAGES)
+            lines.append(f"{'🔒 Locked' if state is False else '🔓 Open'} <#{cid}>")
+        await ctx.send(embed=Embed(title="Lockdown Status", description="\n".join(lines), color=BLURPLE))
 
-    @lockdown.group(name="channel", invoke_without_command=True)
-    @administrator_check()
+    @command("lockdown channel", level="admin")
     async def lockdown_channel(self, ctx):
         await ctx.send("❌ Usage: `?lockdown channel add|remove|list [#channel]`")
 
-    @lockdown_channel.command(name="add")
-    @administrator_check()
-    async def lockdown_channel_add(self, ctx, channel: discord.TextChannel):
+    @command("lockdown channel add", level="admin")
+    async def lockdown_channel_add(self, ctx, channel: ChannelArg):
         with db.get_db() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO lockdown_channels (guild_id, channel_id) VALUES (?, ?)",
-                (ctx.guild.id, channel.id)
-            )
+            conn.execute("INSERT OR IGNORE INTO lockdown_channels (guild_id, channel_id) VALUES (?, ?)", (ctx.guild_id, channel.id))
         await ctx.send(f"✅ {channel.mention} added to lockdown channels.")
 
-    @lockdown_channel.command(name="remove", aliases=["del"])
-    @administrator_check()
-    async def lockdown_channel_remove(self, ctx, channel: discord.TextChannel):
+    @command("lockdown channel remove", level="admin", aliases=("del",))
+    async def lockdown_channel_remove(self, ctx, channel: ChannelArg):
         with db.get_db() as conn:
-            conn.execute(
-                "DELETE FROM lockdown_channels WHERE guild_id = ? AND channel_id = ?",
-                (ctx.guild.id, channel.id)
-            )
+            conn.execute("DELETE FROM lockdown_channels WHERE guild_id = ? AND channel_id = ?", (ctx.guild_id, channel.id))
         await ctx.send(f"✅ {channel.mention} removed from lockdown channels.")
 
-    @lockdown_channel.command(name="list")
-    @administrator_check()
+    @command("lockdown channel list", level="admin")
     async def lockdown_channel_list(self, ctx):
-        with db.get_db() as conn:
-            rows = conn.execute(
-                "SELECT channel_id FROM lockdown_channels WHERE guild_id = ?", (ctx.guild.id,)
-            ).fetchall()
-        if not rows:
+        ids = self._channel_ids(ctx.guild_id)
+        if not ids:
             await ctx.send("No lockdown channels configured.")
             return
-        await ctx.send("Lockdown channels: " + ", ".join(f"<#{r['channel_id']}>" for r in rows))
-
-    async def cog_command_error(self, ctx, error):
-        if isinstance(error, commands.CheckFailure):
-            await ctx.send("You don't have permission to use lockdown commands.")
-        elif isinstance(error, (commands.BadArgument, commands.MissingRequiredArgument)):
-            await ctx.send(f"❌ {error}")
+        await ctx.send("Lockdown channels: " + ", ".join(f"<#{cid}>" for cid in ids))
 
 
 async def setup(bot):

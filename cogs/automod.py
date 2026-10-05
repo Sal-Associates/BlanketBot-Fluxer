@@ -1,9 +1,15 @@
+import re
 import time
-import discord
-from discord.ext import commands
+
+import fluxer
+from fluxer import Embed
+
 import db
-from checks import _is_mod, administrator_check
-from utils import INVITE_RE, LINK_RE
+from checks import is_mod
+from framework import BlanketCog, ChannelArg, RoleArg, command, send_temp
+from utils import BLURPLE, INVITE_RE, LINK_RE, RED
+
+ROLE_MENTION_RE = re.compile(r"<@&\d+>")
 
 THRESHOLD_RANGES = {
     "caps_threshold":    (50, 100),
@@ -19,9 +25,9 @@ THRESHOLD_DEFAULTS = {
 }
 
 
-class Automod(commands.Cog):
+class Automod(BlanketCog):
     def __init__(self, bot):
-        self.bot = bot
+        super().__init__(bot)
         # (guild_id, user_id) -> (count, first_timestamp)
         self._spam_tracker: dict[tuple[int, int], tuple[int, float]] = {}
 
@@ -100,39 +106,42 @@ class Automod(commands.Cog):
         self._spam_tracker[key] = (hits, first)
         return hits >= count
 
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild:
+    @fluxer.Cog.listener()
+    async def on_message(self, message):
+        if message.author.bot:
+            return
+        guild_id = await self.bot.guild_id_of(message)
+        if not guild_id:
             return
 
-        settings = self._get_settings(message.guild.id)
+        settings = self._get_settings(guild_id)
         if not settings or not settings["automod_enabled"]:
             return
 
-        member = message.author
-        if not isinstance(member, discord.Member):
+        member = await self.bot.member(guild_id, message.author.id)
+        if member is None:
             return
-        if _is_mod(member, message.guild.id):
-            return
-
-        role_ids = {r.id for r in member.roles}
-        if self._is_ignored(message.guild.id, message.channel.id, role_ids):
+        if await is_mod(self.bot, guild_id, member):
             return
 
-        content = message.content
+        if self._is_ignored(guild_id, message.channel_id, set(member.roles)):
+            return
+
+        content = message.content or ""
         reason = None
 
-        reason = self._check_banned_words(message.guild.id, content)
+        reason = self._check_banned_words(guild_id, content)
 
         if not reason and settings["anti_invite"] and INVITE_RE.search(content):
             reason = "Discord invite link"
 
         if not reason:
-            reason = self._check_links(message.guild.id, content)
+            reason = self._check_links(guild_id, content)
 
         if not reason and settings["anti_mention"]:
-            mention_count = len(message.mentions) + len(message.role_mentions)
-            if message.mention_everyone or mention_count >= settings["mention_threshold"]:
+            mention_count = len(message.mentions) + len(ROLE_MENTION_RE.findall(content))
+            everyone = "@everyone" in content or "@here" in content
+            if everyone or mention_count >= settings["mention_threshold"]:
                 reason = f"mass mention ({mention_count})"
 
         if not reason and settings["anti_caps"] and len(content) >= 8:
@@ -143,20 +152,17 @@ class Automod(commands.Cog):
                     reason = f"excessive caps ({int(caps_pct)}%)"
 
         if not reason and settings["anti_spam"]:
-            if self._check_spam(message.guild.id, member.id, settings["spam_count"], settings["spam_window"]):
+            if self._check_spam(guild_id, member.user.id, settings["spam_count"], settings["spam_window"]):
                 reason = "spam"
 
         if reason:
             try:
                 await message.delete()
-            except discord.HTTPException:
+            except fluxer.HTTPException:
                 pass
             try:
-                await message.channel.send(
-                    f"{member.mention} Your message was removed for violating server rules.",
-                    delete_after=5
-                )
-            except discord.HTTPException:
+                await send_temp(message, f"{message.author.mention} Your message was removed for violating server rules.", 5)
+            except fluxer.HTTPException:
                 pass
 
     _ALLOWED_COLUMNS = frozenset({
@@ -172,24 +178,23 @@ class Automod(commands.Cog):
         with db.get_db() as conn:
             conn.execute(f"UPDATE guild_settings SET {column} = ? WHERE guild_id = ?", (value, guild_id))
 
-    @commands.group(name="automod", invoke_without_command=True)
-    @administrator_check()
+    @command("automod", level="admin")
     async def automod(self, ctx):
-        settings = db.get_guild_settings(ctx.guild.id)
+        settings = db.get_guild_settings(ctx.guild_id)
         if not settings:
             await ctx.send("No settings yet. Run `?automod on` to get started.")
             return
 
         with db.get_db() as conn:
-            words = conn.execute("SELECT COUNT(*) FROM banned_words WHERE guild_id = ?", (ctx.guild.id,)).fetchone()[0]
-            blacklist = conn.execute("SELECT COUNT(*) FROM automod_links WHERE guild_id = ? AND list_type = 'blacklist'", (ctx.guild.id,)).fetchone()[0]
-            whitelist = conn.execute("SELECT COUNT(*) FROM automod_links WHERE guild_id = ? AND list_type = 'whitelist'", (ctx.guild.id,)).fetchone()[0]
-            ignored_ch = conn.execute("SELECT COUNT(*) FROM automod_ignored WHERE guild_id = ? AND type = 'channel'", (ctx.guild.id,)).fetchone()[0]
-            ignored_roles = conn.execute("SELECT COUNT(*) FROM automod_ignored WHERE guild_id = ? AND type = 'role'", (ctx.guild.id,)).fetchone()[0]
+            words = conn.execute("SELECT COUNT(*) FROM banned_words WHERE guild_id = ?", (ctx.guild_id,)).fetchone()[0]
+            blacklist = conn.execute("SELECT COUNT(*) FROM automod_links WHERE guild_id = ? AND list_type = 'blacklist'", (ctx.guild_id,)).fetchone()[0]
+            whitelist = conn.execute("SELECT COUNT(*) FROM automod_links WHERE guild_id = ? AND list_type = 'whitelist'", (ctx.guild_id,)).fetchone()[0]
+            ignored_ch = conn.execute("SELECT COUNT(*) FROM automod_ignored WHERE guild_id = ? AND type = 'channel'", (ctx.guild_id,)).fetchone()[0]
+            ignored_roles = conn.execute("SELECT COUNT(*) FROM automod_ignored WHERE guild_id = ? AND type = 'role'", (ctx.guild_id,)).fetchone()[0]
 
         def t(val): return "✅ On" if val else "❌ Off"
 
-        embed = discord.Embed(title="Automod Status", color=discord.Color.blurple())
+        embed = Embed(title="Automod Status", color=BLURPLE)
         embed.add_field(name="Automod", value=t(settings["automod_enabled"]), inline=True)
         embed.add_field(name="Anti-spam", value=t(settings["anti_spam"]), inline=True)
         embed.add_field(name="Anti-caps", value=t(settings["anti_caps"]), inline=True)
@@ -205,53 +210,45 @@ class Automod(commands.Cog):
         embed.set_footer(text="Use ?automod threshold show for threshold details")
         await ctx.send(embed=embed)
 
-    @automod.command(name="on")
-    @administrator_check()
+    @command("automod on", level="admin")
     async def automod_on(self, ctx):
-        self._toggle(ctx.guild.id, "automod_enabled", 1)
+        self._toggle(ctx.guild_id, "automod_enabled", 1)
         await ctx.send("✅ Automod enabled.")
 
-    @automod.command(name="off")
-    @administrator_check()
+    @command("automod off", level="admin")
     async def automod_off(self, ctx):
-        self._toggle(ctx.guild.id, "automod_enabled", 0)
+        self._toggle(ctx.guild_id, "automod_enabled", 0)
         await ctx.send("✅ Automod disabled.")
 
-    @automod.command(name="antispam")
-    @administrator_check()
+    @command("automod antispam", level="admin")
     async def automod_antispam(self, ctx, state: str):
         val = 1 if state.lower() in ("on", "enable", "true") else 0
-        self._toggle(ctx.guild.id, "anti_spam", val)
+        self._toggle(ctx.guild_id, "anti_spam", val)
         await ctx.send(f"✅ Anti-spam {'enabled' if val else 'disabled'}.")
 
-    @automod.command(name="anticaps")
-    @administrator_check()
+    @command("automod anticaps", level="admin")
     async def automod_anticaps(self, ctx, state: str):
         val = 1 if state.lower() in ("on", "enable", "true") else 0
-        self._toggle(ctx.guild.id, "anti_caps", val)
+        self._toggle(ctx.guild_id, "anti_caps", val)
         await ctx.send(f"✅ Anti-caps {'enabled' if val else 'disabled'}.")
 
-    @automod.command(name="antiinvite")
-    @administrator_check()
+    @command("automod antiinvite", level="admin")
     async def automod_antiinvite(self, ctx, state: str):
         val = 1 if state.lower() in ("on", "enable", "true") else 0
-        self._toggle(ctx.guild.id, "anti_invite", val)
+        self._toggle(ctx.guild_id, "anti_invite", val)
         await ctx.send(f"✅ Anti-invite {'enabled' if val else 'disabled'}.")
 
-    @automod.command(name="antimention")
-    @administrator_check()
+    @command("automod antimention", level="admin")
     async def automod_antimention(self, ctx, state: str):
         val = 1 if state.lower() in ("on", "enable", "true") else 0
-        self._toggle(ctx.guild.id, "anti_mention", val)
+        self._toggle(ctx.guild_id, "anti_mention", val)
         await ctx.send(f"✅ Anti-mention {'enabled' if val else 'disabled'}.")
 
-    @automod.group(name="word", invoke_without_command=True)
-    @administrator_check()
+    @command("automod word", level="admin")
     async def automod_word(self, ctx):
         await ctx.send("❌ Usage: `?automod word add contains|exact <word,[word,...]>` · `?automod word del <id or text>` · `?automod word list`")
 
-    @automod_word.command(name="add")
-    @administrator_check()
+    @command("automod word add", level="admin")
     async def word_add(self, ctx, match_mode: str, *, words: str):
         if match_mode not in ("contains", "exact"):
             await ctx.send("❌ Match mode must be `contains` or `exact`.")
@@ -265,13 +262,12 @@ class Automod(commands.Cog):
             for word in values:
                 word_id = conn.execute(
                     "INSERT INTO banned_words (guild_id, word, match_mode) VALUES (?, ?, ?)",
-                    (ctx.guild.id, word, match_mode)
+                    (ctx.guild_id, word, match_mode)
                 ).lastrowid
                 added.append(f"`#{word_id}` [{match_mode}] {word}")
         await ctx.send(f"✅ Added {len(added)} banned word(s):\n" + "\n".join(added))
 
-    @automod_word.command(name="del", aliases=["remove"])
-    @administrator_check()
+    @command("automod word del", level="admin", aliases=('remove',))
     async def word_del(self, ctx, *, value: str):
         cleaned = value.replace("#", "").strip()
         with db.get_db() as conn:
@@ -279,7 +275,7 @@ class Automod(commands.Cog):
             if cleaned.isdigit():
                 row = conn.execute(
                     "SELECT id FROM banned_words WHERE id = ? AND guild_id = ?",
-                    (int(cleaned), ctx.guild.id)
+                    (int(cleaned), ctx.guild_id)
                 ).fetchone()
                 if not row:
                     await ctx.send(f"❌ No banned word with ID #{cleaned}.")
@@ -291,7 +287,7 @@ class Automod(commands.Cog):
             # try by value
             rows = conn.execute(
                 "SELECT id, match_mode FROM banned_words WHERE guild_id = ? AND word = ?",
-                (ctx.guild.id, cleaned.lower())
+                (ctx.guild_id, cleaned.lower())
             ).fetchall()
             if not rows:
                 await ctx.send(f"❌ No banned word matching `{cleaned}`. Use `?automod word list` to see IDs.")
@@ -303,215 +299,194 @@ class Automod(commands.Cog):
             conn.execute("DELETE FROM banned_words WHERE id = ?", (rows[0]["id"],))
             await ctx.send(f"✅ Removed [{rows[0]['match_mode']}] `{cleaned}`.")
 
-    @automod_word.command(name="list")
-    @administrator_check()
+    @command("automod word list", level="admin")
     async def word_list(self, ctx):
         with db.get_db() as conn:
             rows = conn.execute(
                 "SELECT id, word, match_mode FROM banned_words WHERE guild_id = ? ORDER BY id",
-                (ctx.guild.id,)
+                (ctx.guild_id,)
             ).fetchall()
         if not rows:
             await ctx.send("No banned words configured.")
             return
         lines = [f"`#{r['id']}` [{r['match_mode']}] {r['word']}" for r in rows]
-        embed = discord.Embed(title="Banned Words", description="\n".join(lines), color=discord.Color.red())
+        embed = Embed(title="Banned Words", description="\n".join(lines), color=RED)
         await ctx.send(embed=embed)
 
-    @automod.group(name="blacklist", invoke_without_command=True)
-    @administrator_check()
+    @command("automod blacklist", level="admin")
     async def automod_blacklist(self, ctx):
         await ctx.send("❌ Usage: `?automod blacklist add|remove|list <link>`")
 
-    @automod_blacklist.command(name="add")
-    @administrator_check()
+    @command("automod blacklist add", level="admin")
     async def blacklist_add(self, ctx, *, links: str):
         items = [l.strip().lower() for l in links.split(",") if l.strip()]
         with db.get_db() as conn:
             for link in items:
                 conn.execute(
                     "INSERT INTO automod_links (guild_id, link, list_type) VALUES (?, ?, 'blacklist')",
-                    (ctx.guild.id, link)
+                    (ctx.guild_id, link)
                 )
         await ctx.send(f"✅ Blacklisted: {', '.join(f'`{i}`' for i in items)}")
 
-    @automod_blacklist.command(name="remove", aliases=["del"])
-    @administrator_check()
+    @command("automod blacklist remove", level="admin", aliases=('del',))
     async def blacklist_remove(self, ctx, *, link: str):
         with db.get_db() as conn:
             conn.execute(
                 "DELETE FROM automod_links WHERE guild_id = ? AND list_type = 'blacklist' AND link = ?",
-                (ctx.guild.id, link.strip().lower())
+                (ctx.guild_id, link.strip().lower())
             )
         await ctx.send(f"✅ Removed `{link}` from blacklist.")
 
-    @automod_blacklist.command(name="list")
-    @administrator_check()
+    @command("automod blacklist list", level="admin")
     async def blacklist_list(self, ctx):
         with db.get_db() as conn:
             rows = conn.execute(
                 "SELECT link FROM automod_links WHERE guild_id = ? AND list_type = 'blacklist' ORDER BY id",
-                (ctx.guild.id,)
+                (ctx.guild_id,)
             ).fetchall()
         if not rows:
             await ctx.send("No blacklisted links. Links are allowed by default — add entries here to block specific domains.")
             return
         await ctx.send("Blacklisted links:\n" + "\n".join(f"`{r['link']}`" for r in rows))
 
-    @automod.group(name="whitelist", invoke_without_command=True)
-    @administrator_check()
+    @command("automod whitelist", level="admin")
     async def automod_whitelist(self, ctx):
         await ctx.send("❌ Usage: `?automod whitelist add|remove|list <link>`")
 
-    @automod_whitelist.command(name="add")
-    @administrator_check()
+    @command("automod whitelist add", level="admin")
     async def whitelist_add(self, ctx, *, links: str):
         items = [l.strip().lower() for l in links.split(",") if l.strip()]
         with db.get_db() as conn:
             for link in items:
                 conn.execute(
                     "INSERT INTO automod_links (guild_id, link, list_type) VALUES (?, ?, 'whitelist')",
-                    (ctx.guild.id, link)
+                    (ctx.guild_id, link)
                 )
         await ctx.send(f"✅ Whitelisted: {', '.join(f'`{i}`' for i in items)}")
 
-    @automod_whitelist.command(name="remove", aliases=["del"])
-    @administrator_check()
+    @command("automod whitelist remove", level="admin", aliases=('del',))
     async def whitelist_remove(self, ctx, *, link: str):
         with db.get_db() as conn:
             conn.execute(
                 "DELETE FROM automod_links WHERE guild_id = ? AND list_type = 'whitelist' AND link = ?",
-                (ctx.guild.id, link.strip().lower())
+                (ctx.guild_id, link.strip().lower())
             )
         await ctx.send(f"✅ Removed `{link}` from whitelist.")
 
-    @automod_whitelist.command(name="list")
-    @administrator_check()
+    @command("automod whitelist list", level="admin")
     async def whitelist_list(self, ctx):
         with db.get_db() as conn:
             rows = conn.execute(
                 "SELECT link FROM automod_links WHERE guild_id = ? AND list_type = 'whitelist' ORDER BY id",
-                (ctx.guild.id,)
+                (ctx.guild_id,)
             ).fetchall()
         if not rows:
             await ctx.send("No whitelisted links.")
             return
         await ctx.send("Whitelisted links:\n" + "\n".join(f"`{r['link']}`" for r in rows))
 
-    @automod.group(name="ignore", invoke_without_command=True)
-    @administrator_check()
+    @command("automod ignore", level="admin")
     async def automod_ignore(self, ctx):
         await ctx.send("❌ Usage: `?automod ignore channel|role add|remove|list`")
 
-    @automod_ignore.group(name="channel", invoke_without_command=True)
-    @administrator_check()
+    @command("automod ignore channel", level="admin")
     async def ignore_channel(self, ctx):
         await ctx.send("❌ Usage: `?automod ignore channel add|remove|list [#channel]`")
 
-    @ignore_channel.command(name="add")
-    @administrator_check()
-    async def ignore_channel_add(self, ctx, channel: discord.TextChannel):
+    @command("automod ignore channel add", level="admin")
+    async def ignore_channel_add(self, ctx, channel: ChannelArg):
         with db.get_db() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO automod_ignored (guild_id, type, target_id) VALUES (?, 'channel', ?)",
-                (ctx.guild.id, channel.id)
+                (ctx.guild_id, channel.id)
             )
         await ctx.send(f"✅ {channel.mention} added to automod ignore list.")
 
-    @ignore_channel.command(name="remove", aliases=["del"])
-    @administrator_check()
-    async def ignore_channel_remove(self, ctx, channel: discord.TextChannel):
+    @command("automod ignore channel remove", level="admin", aliases=('del',))
+    async def ignore_channel_remove(self, ctx, channel: ChannelArg):
         with db.get_db() as conn:
             conn.execute(
                 "DELETE FROM automod_ignored WHERE guild_id = ? AND type = 'channel' AND target_id = ?",
-                (ctx.guild.id, channel.id)
+                (ctx.guild_id, channel.id)
             )
         await ctx.send(f"✅ {channel.mention} removed from automod ignore list.")
 
-    @ignore_channel.command(name="list")
-    @administrator_check()
+    @command("automod ignore channel list", level="admin")
     async def ignore_channel_list(self, ctx):
         with db.get_db() as conn:
             rows = conn.execute(
                 "SELECT target_id FROM automod_ignored WHERE guild_id = ? AND type = 'channel'",
-                (ctx.guild.id,)
+                (ctx.guild_id,)
             ).fetchall()
         if not rows:
             await ctx.send("No ignored channels.")
             return
         await ctx.send("Ignored channels: " + ", ".join(f"<#{r['target_id']}>" for r in rows))
 
-    @automod_ignore.group(name="role", invoke_without_command=True)
-    @administrator_check()
+    @command("automod ignore role", level="admin")
     async def ignore_role(self, ctx):
         await ctx.send("❌ Usage: `?automod ignore role add|remove|list [@role]`")
 
-    @ignore_role.command(name="add")
-    @administrator_check()
-    async def ignore_role_add(self, ctx, role: discord.Role):
-        if role == ctx.guild.default_role:
+    @command("automod ignore role add", level="admin")
+    async def ignore_role_add(self, ctx, role: RoleArg):
+        if role.id == ctx.guild_id:
             await ctx.send("❌ `@everyone` cannot be ignored — it would disable automod for the whole server.")
             return
         with db.get_db() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO automod_ignored (guild_id, type, target_id) VALUES (?, 'role', ?)",
-                (ctx.guild.id, role.id)
+                (ctx.guild_id, role.id)
             )
         await ctx.send(f"✅ **{role.name}** added to automod ignore list.")
 
-    @ignore_role.command(name="remove", aliases=["del"])
-    @administrator_check()
-    async def ignore_role_remove(self, ctx, role: discord.Role):
+    @command("automod ignore role remove", level="admin", aliases=('del',))
+    async def ignore_role_remove(self, ctx, role: RoleArg):
         with db.get_db() as conn:
             conn.execute(
                 "DELETE FROM automod_ignored WHERE guild_id = ? AND type = 'role' AND target_id = ?",
-                (ctx.guild.id, role.id)
+                (ctx.guild_id, role.id)
             )
         await ctx.send(f"✅ **{role.name}** removed from automod ignore list.")
 
-    @ignore_role.command(name="list")
-    @administrator_check()
+    @command("automod ignore role list", level="admin")
     async def ignore_role_list(self, ctx):
         with db.get_db() as conn:
             rows = conn.execute(
                 "SELECT target_id FROM automod_ignored WHERE guild_id = ? AND type = 'role'",
-                (ctx.guild.id,)
+                (ctx.guild_id,)
             ).fetchall()
         if not rows:
             await ctx.send("No ignored roles.")
             return
         await ctx.send("Ignored roles: " + ", ".join(f"<@&{r['target_id']}>" for r in rows))
 
-    @automod.command(name="ignored")
-    @administrator_check()
+    @command("automod ignored", level="admin")
     async def automod_ignored(self, ctx):
         with db.get_db() as conn:
             channels = conn.execute(
-                "SELECT target_id FROM automod_ignored WHERE guild_id = ? AND type = 'channel'", (ctx.guild.id,)
+                "SELECT target_id FROM automod_ignored WHERE guild_id = ? AND type = 'channel'", (ctx.guild_id,)
             ).fetchall()
             roles = conn.execute(
-                "SELECT target_id FROM automod_ignored WHERE guild_id = ? AND type = 'role'", (ctx.guild.id,)
+                "SELECT target_id FROM automod_ignored WHERE guild_id = ? AND type = 'role'", (ctx.guild_id,)
             ).fetchall()
         ch_lines = [f"<#{r['target_id']}>" for r in channels] or ["None"]
         role_lines = [f"<@&{r['target_id']}>" for r in roles] or ["None"]
-        embed = discord.Embed(title="Automod Ignored", color=discord.Color.blurple())
+        embed = Embed(title="Automod Ignored", color=BLURPLE)
         embed.add_field(name=f"Channels ({len(channels)})", value="\n".join(ch_lines), inline=True)
         embed.add_field(name=f"Roles ({len(roles)})", value="\n".join(role_lines), inline=True)
         await ctx.send(embed=embed)
 
-    @automod.group(name="threshold", invoke_without_command=True)
-    @administrator_check()
+    @command("automod threshold", level="admin")
     async def threshold(self, ctx):
         await ctx.send("❌ Usage: `?automod threshold show|reset|spam-count|spam-window|caps|mentions`")
 
-    @threshold.command(name="show")
-    @administrator_check()
+    @command("automod threshold show", level="admin")
     async def threshold_show(self, ctx):
-        s = db.get_guild_settings(ctx.guild.id)
+        s = db.get_guild_settings(ctx.guild_id)
         if not s:
             await ctx.send("No settings configured yet.")
             return
-        embed = discord.Embed(title="Automod Thresholds", color=discord.Color.blurple())
+        embed = Embed(title="Automod Thresholds", color=BLURPLE)
         embed.add_field(
             name="Spam",
             value=f"{s['spam_count']} messages within {s['spam_window']}s — anti-spam {'✅' if s['anti_spam'] else '❌'}",
@@ -529,8 +504,7 @@ class Automod(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    @threshold.command(name="reset")
-    @administrator_check()
+    @command("automod threshold reset", level="admin")
     async def threshold_reset(self, ctx, target: str):
         updates = {}
         if target == "caps":
@@ -544,10 +518,10 @@ class Automod(commands.Cog):
         else:
             await ctx.send("❌ Usage: `?automod threshold reset caps|spam|mentions|all`")
             return
-        db.ensure_guild_settings(ctx.guild.id)
+        db.ensure_guild_settings(ctx.guild_id)
         with db.get_db() as conn:
             for col, val in updates.items():
-                conn.execute(f"UPDATE guild_settings SET {col} = ? WHERE guild_id = ?", (val, ctx.guild.id))
+                conn.execute(f"UPDATE guild_settings SET {col} = ? WHERE guild_id = ?", (val, ctx.guild_id))
         await ctx.send(f"✅ Reset **{target}** threshold(s) to defaults.")
 
     def _set_threshold(self, guild_id, column, value, min_val, max_val):
@@ -560,35 +534,25 @@ class Automod(commands.Cog):
             conn.execute(f"UPDATE guild_settings SET {column} = ? WHERE guild_id = ?", (value, guild_id))
         return True, None
 
-    @threshold.command(name="spam-count")
-    @administrator_check()
+    @command("automod threshold spam-count", level="admin")
     async def threshold_spam_count(self, ctx, count: int):
-        ok, err = self._set_threshold(ctx.guild.id, "spam_count", count, *THRESHOLD_RANGES["spam_count"])
+        ok, err = self._set_threshold(ctx.guild_id, "spam_count", count, *THRESHOLD_RANGES["spam_count"])
         await ctx.send(f"✅ Spam count set to {count} messages." if ok else f"❌ {err}")
 
-    @threshold.command(name="spam-window")
-    @administrator_check()
+    @command("automod threshold spam-window", level="admin")
     async def threshold_spam_window(self, ctx, seconds: int):
-        ok, err = self._set_threshold(ctx.guild.id, "spam_window", seconds, *THRESHOLD_RANGES["spam_window"])
+        ok, err = self._set_threshold(ctx.guild_id, "spam_window", seconds, *THRESHOLD_RANGES["spam_window"])
         await ctx.send(f"✅ Spam window set to {seconds}s." if ok else f"❌ {err}")
 
-    @threshold.command(name="caps")
-    @administrator_check()
+    @command("automod threshold caps", level="admin")
     async def threshold_caps(self, ctx, percent: int):
-        ok, err = self._set_threshold(ctx.guild.id, "caps_threshold", percent, *THRESHOLD_RANGES["caps_threshold"])
+        ok, err = self._set_threshold(ctx.guild_id, "caps_threshold", percent, *THRESHOLD_RANGES["caps_threshold"])
         await ctx.send(f"✅ Caps threshold set to {percent}%." if ok else f"❌ {err}")
 
-    @threshold.command(name="mentions")
-    @administrator_check()
+    @command("automod threshold mentions", level="admin")
     async def threshold_mentions(self, ctx, count: int):
-        ok, err = self._set_threshold(ctx.guild.id, "mention_threshold", count, *THRESHOLD_RANGES["mention_threshold"])
+        ok, err = self._set_threshold(ctx.guild_id, "mention_threshold", count, *THRESHOLD_RANGES["mention_threshold"])
         await ctx.send(f"✅ Mention threshold set to {count}." if ok else f"❌ {err}")
-
-    async def cog_command_error(self, ctx, error):
-        if isinstance(error, commands.CheckFailure):
-            await ctx.send("You don't have permission to configure automod.")
-        elif isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
-            await ctx.send(f"❌ {error}")
 
 
 async def setup(bot):

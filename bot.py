@@ -1,124 +1,96 @@
 import asyncio
+import logging
 import os
 import time
-import discord
-from discord import app_commands
-from discord.ext import commands
+
+import fluxer
 from dotenv import load_dotenv
+
 import db
+from framework import BlanketBot
+from utils import auto_unmute
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-intents.moderation = True
+COGS = [
+    "cogs.general",
+    "cogs.settings",
+    "cogs.staff",
+    "cogs.moderation",
+    "cogs.muterole",
+    "cogs.mod_log",
+    "cogs.modlogs",
+    "cogs.notes",
+    "cogs.purge",
+    "cogs.whois",
+    "cogs.info",
+    "cogs.channel",
+    "cogs.automod",
+    "cogs.lockdown",
+    "cogs.scam_detection",
+]
 
-bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
+# GUILD_MEMBERS and MESSAGE_CONTENT are privileged intents
+intents = fluxer.Intents.default() | fluxer.Intents.GUILD_MEMBERS | fluxer.Intents.MESSAGE_CONTENT
 
 
-@bot.event
-async def on_ready():
-    await bot.tree.sync()
-    await _restore_timed_mutes()
-    print(f"logged in as {bot.user} ({bot.user.id})")
+class Bot(BlanketBot):
+    def __init__(self):
+        super().__init__(intents=intents, api_url=os.getenv("FLUXER_API_URL") or None)
+        self._ready_once = False
+        self.on("ready")(self._on_ready)
 
+    async def setup_hook(self):
+        db.init_db()
+        for cog in COGS:
+            await self.load_extension(cog)
 
-async def _restore_timed_mutes():
-    now = time.time()
-    with db.get_db() as conn:
-        rows = conn.execute("SELECT * FROM timed_mutes").fetchall()
+    async def _on_ready(self):
+        print(f"logged in as {self.user.username} ({self.user.id})")
+        if self._ready_once:
+            return  # READY fires again after a full reconnect
+        self._ready_once = True
+        await self._restore_timed_mutes()
 
-    for row in rows:
-        guild = bot.get_guild(row["guild_id"])
-        if not guild:
-            continue
-        role = guild.get_role(row["role_id"])
-        if not role:
-            with db.get_db() as conn:
-                conn.execute("DELETE FROM timed_mutes WHERE id = ?", (row["id"],))
-            continue
-        member = guild.get_member(row["user_id"])
-        if member is None:
-            try:
-                member = await guild.fetch_member(row["user_id"])
-            except discord.NotFound:
+    async def _restore_timed_mutes(self):
+        now = time.time()
+        with db.get_db() as conn:
+            rows = conn.execute("SELECT * FROM timed_mutes").fetchall()
+
+        for row in rows:
+            guild_id, user_id, role_id = row["guild_id"], row["user_id"], row["role_id"]
+            if self.get_guild(guild_id) is None:
+                continue
+            if role_id not in await self.roles(guild_id):
                 with db.get_db() as conn:
                     conn.execute("DELETE FROM timed_mutes WHERE id = ?", (row["id"],))
                 continue
-            except discord.HTTPException:
+            member = await self.member(guild_id, user_id)
+            if member is None:
+                with db.get_db() as conn:
+                    conn.execute("DELETE FROM timed_mutes WHERE id = ?", (row["id"],))
                 continue
-        delay = row["expires_at"] - now
-        if delay <= 0:
-            if role in member.roles:
-                try:
-                    await member.remove_roles(role, reason="Mute expired (bot restart)")
-                except discord.HTTPException:
-                    pass
-            with db.get_db() as conn:
-                conn.execute("DELETE FROM timed_mutes WHERE id = ?", (row["id"],))
-        else:
-            asyncio.create_task(_auto_unmute(row["id"], member, role, delay))
+            delay = row["expires_at"] - now
+            if delay <= 0:
+                if role_id in member.roles:
+                    try:
+                        await self.http.remove_guild_member_role(guild_id, user_id, role_id, reason="Mute expired (bot restart)")
+                    except fluxer.HTTPException:
+                        pass
+                    self.invalidate_member(guild_id, user_id)
+                with db.get_db() as conn:
+                    conn.execute("DELETE FROM timed_mutes WHERE id = ?", (row["id"],))
+            else:
+                asyncio.create_task(auto_unmute(self, row["id"], guild_id, user_id, role_id, delay))
 
 
-from utils import auto_unmute as _auto_unmute
-
-
-@bot.tree.error
-async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CheckFailure):
-        msg = str(error) or "You don't have permission to use this command."
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
-    else:
-        print(f"Unhandled tree error in {interaction.command}: {error}")
-        try:
-            await interaction.response.send_message("Something went wrong. Please try again.", ephemeral=True)
-        except discord.HTTPException:
-            pass
-
-
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CheckFailure):
-        await ctx.send("You don't have permission to use this command.")
-    elif isinstance(error, commands.CommandNotFound):
-        pass
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"❌ Missing argument: `{error.param.name}`.")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send(f"❌ Bad argument: {error}")
-    else:
-        raise error
-
-
-async def main():
-    token = os.getenv("DISCORD_TOKEN")
+def main():
+    token = os.getenv("FLUXER_TOKEN")
     if not token:
-        raise RuntimeError("DISCORD_TOKEN is not set. Copy .env.example to .env and fill in your token.")
-    db.init_db()
-    async with bot:
-        for cog in [
-            "cogs.general",
-            "cogs.settings",
-            "cogs.staff",
-            "cogs.moderation",
-            "cogs.muterole",
-            "cogs.mod_log",
-            "cogs.modlogs",
-            "cogs.notes",
-            "cogs.purge",
-            "cogs.whois",
-            "cogs.info",
-            "cogs.channel",
-            "cogs.automod",
-            "cogs.lockdown",
-            "cogs.scam_detection",
-        ]:
-            await bot.load_extension(cog)
-        await bot.start(token)
+        raise RuntimeError("FLUXER_TOKEN is not set. Copy .env.example to .env and fill in your token.")
+    Bot().run(token)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    main()

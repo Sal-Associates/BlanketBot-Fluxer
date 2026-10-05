@@ -1,100 +1,72 @@
-import discord
-from discord import app_commands
-from discord.ext import commands
+import fluxer
+from fluxer import Permissions
+
 import db
-from checks import moderator_check, administrator_check, slash_mod_check
+from cogs.mod_log import Target, record_action
+from framework import BlanketCog, ChannelArg, command, is_text_channel
 
 
-class Channel(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
+class Channel(BlanketCog):
 
-    async def _lock(self, channel, actor, guild):
-        if not isinstance(channel, discord.TextChannel | discord.Thread):
-            return False, "Can only lock text channels or threads."
-        everyone = guild.default_role
-        overwrite = channel.overwrites_for(everyone)
-        db.save_permission_snapshot(guild.id, channel.id, "lock", overwrite.send_messages)
+    async def _target(self, ctx, channel):
+        """Resolve the optional channel argument, defaulting to the current channel."""
+        channels = await self.bot.guild_channels(ctx.guild_id)
+        raw = channels.get(channel.id if channel else ctx.channel_id)
+        return raw
+
+    async def _lock(self, ctx, raw):
+        if not raw or not is_text_channel(raw):
+            return "Can only lock text channels."
+        cid, everyone = int(raw["id"]), ctx.guild_id
+        previous = await self.bot.get_perm_state(cid, everyone, Permissions.SEND_MESSAGES)
+        db.save_permission_snapshot(ctx.guild_id, cid, "lock", previous)
         try:
-            await channel.set_permissions(everyone, send_messages=False)
-        except discord.Forbidden:
-            return False, "I don't have permission to lock that channel."
-        self.bot.dispatch("mod_action", "lock", actor, channel, None, guild)
-        return True, f"🔒 Locked {channel.mention}."
+            await self.bot.set_perm_state(cid, everyone, {Permissions.SEND_MESSAGES: False})
+        except fluxer.Forbidden:
+            return "I don't have permission to lock that channel."
+        await record_action(self.bot, ctx.guild_id, "lock", ctx.author, Target("channel", cid, raw.get("name") or str(cid)), None)
+        return f"🔒 Locked <#{cid}>."
 
-    async def _unlock(self, channel, actor, guild):
-        if not isinstance(channel, discord.TextChannel | discord.Thread):
-            return False, "Can only unlock text channels or threads."
-        everyone = guild.default_role
-        restore = db.pop_permission_snapshot(guild.id, channel.id, "lock")
+    async def _unlock(self, ctx, raw):
+        if not raw or not is_text_channel(raw):
+            return "Can only unlock text channels."
+        cid, everyone = int(raw["id"]), ctx.guild_id
+        restore = db.pop_permission_snapshot(ctx.guild_id, cid, "lock")
         try:
-            await channel.set_permissions(everyone, send_messages=restore)
-        except discord.Forbidden:
-            return False, "I don't have permission to unlock that channel."
-        self.bot.dispatch("mod_action", "unlock", actor, channel, None, guild)
-        return True, f"🔓 Unlocked {channel.mention}."
+            await self.bot.set_perm_state(cid, everyone, {Permissions.SEND_MESSAGES: restore})
+        except fluxer.Forbidden:
+            return "I don't have permission to unlock that channel."
+        await record_action(self.bot, ctx.guild_id, "unlock", ctx.author, Target("channel", cid, raw.get("name") or str(cid)), None)
+        return f"🔓 Unlocked <#{cid}>."
 
-    @app_commands.command(name="lock", description="Lock a channel")
-    @app_commands.describe(channel="Channel to lock (defaults to current)")
-    @app_commands.check(slash_mod_check)
-    async def slash_lock(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
-        target = channel or interaction.channel
-        ok, msg = await self._lock(target, interaction.user, interaction.guild)
-        await interaction.response.send_message(msg, ephemeral=not ok)
-
-    @app_commands.command(name="unlock", description="Unlock a channel")
-    @app_commands.describe(channel="Channel to unlock (defaults to current)")
-    @app_commands.check(slash_mod_check)
-    async def slash_unlock(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
-        target = channel or interaction.channel
-        ok, msg = await self._unlock(target, interaction.user, interaction.guild)
-        await interaction.response.send_message(msg, ephemeral=not ok)
-
-    @app_commands.command(name="slowmode", description="Set slowmode for a channel (0 to disable)")
-    @app_commands.describe(seconds="Delay in seconds (0-21600)", channel="Channel (defaults to current)")
-    @app_commands.check(slash_mod_check)
-    async def slash_slowmode(self, interaction: discord.Interaction, seconds: int, channel: discord.TextChannel = None):
-        if not (0 <= seconds <= 21600):
-            await interaction.response.send_message("Seconds must be between 0 and 21600.", ephemeral=True)
-            return
-        target = channel or interaction.channel
-        await target.edit(slowmode_delay=seconds)
-        msg = f"Slowmode disabled in {target.mention}." if seconds == 0 else f"Slowmode set to **{seconds}s** in {target.mention}."
-        await interaction.response.send_message(msg)
-
-    @commands.group(name="channel", invoke_without_command=True)
-    @moderator_check()
-    async def prefix_channel(self, ctx):
+    @command("channel", level="mod")
+    async def channel(self, ctx):
         await ctx.send("❌ Usage: `?channel lock|unlock|slowmode`")
 
-    @prefix_channel.command(name="lock")
-    @moderator_check()
-    async def channel_lock(self, ctx, channel: discord.TextChannel = None):
-        _, msg = await self._lock(channel or ctx.channel, ctx.author, ctx.guild)
-        await ctx.send(msg)
+    @command("channel lock", level="mod")
+    async def channel_lock(self, ctx, channel: ChannelArg = None):
+        await ctx.send(await self._lock(ctx, await self._target(ctx, channel)))
 
-    @prefix_channel.command(name="unlock")
-    @moderator_check()
-    async def channel_unlock(self, ctx, channel: discord.TextChannel = None):
-        _, msg = await self._unlock(channel or ctx.channel, ctx.author, ctx.guild)
-        await ctx.send(msg)
+    @command("channel unlock", level="mod")
+    async def channel_unlock(self, ctx, channel: ChannelArg = None):
+        await ctx.send(await self._unlock(ctx, await self._target(ctx, channel)))
 
-    @prefix_channel.command(name="slowmode")
-    @moderator_check()
-    async def channel_slowmode(self, ctx, seconds: int, channel: discord.TextChannel = None):
+    @command("channel slowmode", level="mod")
+    async def channel_slowmode(self, ctx, seconds: int, channel: ChannelArg = None):
         if not (0 <= seconds <= 21600):
             await ctx.send("Seconds must be between 0 and 21600.")
             return
-        target = channel or ctx.channel
-        await target.edit(slowmode_delay=seconds)
-        msg = f"Slowmode disabled in {target.mention}." if seconds == 0 else f"Slowmode set to **{seconds}s** in {target.mention}."
-        await ctx.send(msg)
-
-    async def cog_command_error(self, ctx, error):
-        if isinstance(error, commands.MissingPermissions):
-            await ctx.send("You don't have permission to do that.")
-        elif isinstance(error, commands.BadArgument):
-            await ctx.send(f"❌ {error}")
+        raw = await self._target(ctx, channel)
+        if not raw or not is_text_channel(raw):
+            await ctx.send("❌ Slowmode only applies to text channels.")
+            return
+        cid = int(raw["id"])
+        await self.bot.http.modify_channel(cid, rate_limit_per_user=seconds)
+        self.bot.invalidate_channels(ctx.guild_id)
+        if seconds == 0:
+            await ctx.send(f"Slowmode disabled in <#{cid}>.")
+        else:
+            await ctx.send(f"Slowmode set to **{seconds}s** in <#{cid}>.")
 
 
 async def setup(bot):

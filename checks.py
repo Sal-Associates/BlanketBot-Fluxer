@@ -1,67 +1,32 @@
-import discord
-from discord import app_commands
-from discord.ext import commands
+from fluxer import Permissions
 import db
 
+MOD_PERMS = (
+    Permissions.ADMINISTRATOR
+    | Permissions.KICK_MEMBERS
+    | Permissions.BAN_MEMBERS
+    | Permissions.MODERATE_MEMBERS
+    | Permissions.MANAGE_MESSAGES
+)
 
-def _is_mod(member: discord.Member, guild_id: int) -> bool:
-    perms = member.guild_permissions
-    if perms.administrator or perms.kick_members or perms.ban_members or perms.moderate_members or perms.manage_messages:
-        return True
-    member_role_ids = {r.id for r in member.roles}
+
+def _staff_role_ids(guild_id: int, role_types: tuple[str, ...]) -> set[int]:
+    marks = ",".join("?" * len(role_types))
     with db.get_db() as conn:
         rows = conn.execute(
-            "SELECT role_id FROM staff_roles WHERE guild_id = ? AND role_type IN ('mod', 'admin')",
-            (guild_id,)
+            f"SELECT role_id FROM staff_roles WHERE guild_id = ? AND role_type IN ({marks})",
+            (guild_id, *role_types),
         ).fetchall()
-    return any(row["role_id"] in member_role_ids for row in rows)
+    return {row["role_id"] for row in rows}
 
 
-def _is_admin(member: discord.Member, guild_id: int) -> bool:
-    if member.guild_permissions.administrator:
+async def is_mod(bot, guild_id: int, member) -> bool:
+    if await bot.perms(guild_id, member) & MOD_PERMS:
         return True
-    member_role_ids = {r.id for r in member.roles}
-    with db.get_db() as conn:
-        rows = conn.execute(
-            "SELECT role_id FROM staff_roles WHERE guild_id = ? AND role_type = 'admin'",
-            (guild_id,)
-        ).fetchall()
-    return any(row["role_id"] in member_role_ids for row in rows)
+    return bool(set(member.roles) & _staff_role_ids(guild_id, ("mod", "admin")))
 
 
-# prefix command checks
-def moderator_check():
-    async def predicate(ctx: commands.Context) -> bool:
-        if not isinstance(ctx.author, discord.Member):
-            raise commands.CheckFailure("This command can only be used in a server.")
-        if not _is_mod(ctx.author, ctx.guild.id):
-            raise commands.CheckFailure("You don't have permission to use this command.")
+async def is_admin(bot, guild_id: int, member) -> bool:
+    if await bot.perms(guild_id, member) & Permissions.ADMINISTRATOR:
         return True
-    return commands.check(predicate)
-
-
-def administrator_check():
-    async def predicate(ctx: commands.Context) -> bool:
-        if not isinstance(ctx.author, discord.Member):
-            raise commands.CheckFailure("This command can only be used in a server.")
-        if not _is_admin(ctx.author, ctx.guild.id):
-            raise commands.CheckFailure("You don't have permission to use this command.")
-        return True
-    return commands.check(predicate)
-
-
-# slash command checks — replaces @app_commands.default_permissions so staff roles work
-async def slash_mod_check(interaction: discord.Interaction) -> bool:
-    if not isinstance(interaction.user, discord.Member):
-        raise app_commands.CheckFailure("This command can only be used in a server.")
-    if _is_mod(interaction.user, interaction.guild_id):
-        return True
-    raise app_commands.CheckFailure("You don't have permission to use this command.")
-
-
-async def slash_admin_check(interaction: discord.Interaction) -> bool:
-    if not isinstance(interaction.user, discord.Member):
-        raise app_commands.CheckFailure("This command can only be used in a server.")
-    if _is_admin(interaction.user, interaction.guild_id):
-        return True
-    raise app_commands.CheckFailure("You don't have permission to use this command.")
+    return bool(set(member.roles) & _staff_role_ids(guild_id, ("admin",)))

@@ -1,15 +1,15 @@
 # BlanketBot
 
-A Discord moderation and logging bot
+A moderation and logging bot for Fluxer, built on fluxer.py
 
 ---
 
 ## Requirements
 
 - Python 3.12+
-- discord.py 2.7.1+
-- python-dotenv 1.2.2+
-- A Working Computer
+- fluxer.py 0.4.2+
+- python-dotenv, aiohttp, Pillow, pytesseract, python-Levenshtein
+- Tesseract OCR installed on the host (scam detection; the Docker image includes it)
 
 ```
 pip install -r requirements.txt
@@ -18,21 +18,15 @@ pip install -r requirements.txt
 ---
 ## Setup (Docker)
 
-1. Create a bot at [discord.com/developers/applications](https://discord.com/developers/applications)
-2. Under **Bot**, enable: **Server Members Intent**, **Message Content Intent**
-3. Under **OAuth2 → URL Generator**, select scopes: `bot`, `applications.commands`
-4. Select permissions: Manage Roles, Manage Channels, Kick Members, Ban Members, Moderate Members, Manage Messages, Read Message History, View Audit Log
-5. Copy `.env.example` to `.env` and fill in your token
-6. Run: `docker compose up -d`
+1. Create a bot application on Fluxer and copy its token
+2. Enable the privileged intents the bot requests: **Server Members** and **Message Content**
+3. Invite the bot with the permissions listed under Permissions Required below
+4. Copy `.env.example` to `.env` and fill in your token
+5. Run: `docker compose up -d`
 
 ## Setup
 
-1. Create a bot at [discord.com/developers/applications](https://discord.com/developers/applications)
-2. Under **Bot**, enable: **Server Members Intent**, **Message Content Intent**
-3. Under **OAuth2 → URL Generator**, select scopes: `bot`, `applications.commands`
-4. Select permissions: Manage Roles, Manage Channels, Kick Members, Ban Members, Moderate Members, Manage Messages, Read Message History, View Audit Log
-5. Copy `.env.example` to `.env` and fill in your token
-6. Run: `python3 bot.py`
+Steps 1 to 4 are the same as above, then run: `python3 bot.py`
 
 ---
 
@@ -40,8 +34,11 @@ pip install -r requirements.txt
 
 | Variable | Required | Description |
 |---|---|---|
-| `DISCORD_TOKEN` | Yes | Your bot token |
+| `FLUXER_TOKEN` | Yes | Your bot token |
+| `FLUXER_API_URL` | No | API base URL for a self-hosted Fluxer instance |
+| `COMMAND_PREFIX` | No | Command prefix (default `?`) |
 | `LOG_CHANNEL_ID` | No | Fallback log channel ID if a guild hasn't run `?settings logchannel` |
+| `DB_PATH` | No | SQLite path (default `bot.db`) |
 
 ---
 
@@ -62,9 +59,7 @@ Run these after inviting the bot.
 
 ## Command Reference
 
-Prefix: `?`  
-Moderation commands also have `/` slash equivalents.  
-Admin commands are prefix-only.
+Prefix: `?` (configurable). All commands are prefix commands.
 
 ---
 
@@ -109,10 +104,10 @@ Default (no filter): deletes up to 100 recent messages.
 
 | Command | Description |
 |---|---|
-| `?modlogs @user` | View mod history for a user |
+| `?modlogs @user [page]` | View mod history for a user (5 cases per page) |
 | `?modstats [@mod]` | Mod action stats. Omit mod for server-wide stats. |
 | `?case <number>` | Look up a specific case by number |
-| `?whois [@user]` | User profile: roles, join date, warning count, recent cases |
+| `?whois [@user]` | User profile: roles, join date, warning count, recent cases (any member) |
 
 ---
 
@@ -120,7 +115,7 @@ Default (no filter): deletes up to 100 recent messages.
 
 | Command | Description |
 |---|---|
-| `?info server` | Server info (member count, roles, boost level, creation date) |
+| `?info server` | Server info (member count, channels, roles, creation date) |
 | `?info channel [#channel]` | Channel info |
 | `?help` | Command list |
 | `?about` | Bot info |
@@ -144,7 +139,7 @@ Default (no filter): deletes up to 100 recent messages.
 | `?muterole` | View current mute role |
 | `?muterole create` | Create a Muted role and apply deny permissions to all text channels |
 | `?muterole set @role` | Use an existing role as the mute role |
-| `?muterole off` | Clear mute role (mutes fall back to Discord timeout) |
+| `?muterole off` | Clear mute role (mutes fall back to timeout) |
 
 ---
 
@@ -221,10 +216,9 @@ Automod is disabled by default. Enable it with `?automod on`.
 | Manage Channels | Channel lock, lockdown, slowmode, mute role setup |
 | Kick Members | Kick |
 | Ban Members | Ban, unban, softban |
-| Moderate Members | Discord timeout fallback |
+| Moderate Members | Timeout fallback and scam auto-timeout |
 | Manage Messages | Purge, automod message deletion |
 | Read Message History | Purge |
-| View Audit Log | (optional) Audit log features |
 
 ---
 

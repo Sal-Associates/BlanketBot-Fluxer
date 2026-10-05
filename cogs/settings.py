@@ -1,60 +1,45 @@
-import discord
-from discord import app_commands
-from discord.ext import commands
+from fluxer import Embed
+
 import db
-from checks import administrator_check
+from framework import BlanketCog, ChannelArg, UserError, command
+from utils import BLURPLE
 
 
-class Settings(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
+class Settings(BlanketCog):
 
-    @commands.group(name="settings", invoke_without_command=True)
-    @administrator_check()
+    @command("settings", level="admin")
     async def settings(self, ctx):
-        row = db.get_guild_settings(ctx.guild.id)
+        row = db.get_guild_settings(ctx.guild_id)
         if not row:
             await ctx.send("No settings configured yet. Use `?settings logchannel #channel` to get started.")
             return
-
         log_ch = f"<#{row['log_channel']}>" if row["log_channel"] else "Not set"
         automod = "Enabled" if row["automod_enabled"] else "Disabled"
-
-        embed = discord.Embed(title=f"Settings — {ctx.guild.name}", color=discord.Color.blurple())
+        guild = ctx.guild
+        embed = Embed(title=f"Settings \u2014 {guild.name if guild else ctx.guild_id}", color=BLURPLE)
         embed.add_field(name="Log channel", value=log_ch, inline=True)
         embed.add_field(name="Automod", value=automod, inline=True)
         await ctx.send(embed=embed)
 
-    @settings.command(name="logchannel")
-    @administrator_check()
-    async def settings_logchannel(self, ctx, channel: discord.TextChannel | str = None):
-        if channel == "off" or channel is None:
-            db.ensure_guild_settings(ctx.guild.id)
+    @command("settings logchannel", level="admin")
+    async def settings_logchannel(self, ctx, channel: str = None):
+        db.ensure_guild_settings(ctx.guild_id)
+        if channel is None or channel.lower() == "off":
             with db.get_db() as conn:
-                conn.execute(
-                    "UPDATE guild_settings SET log_channel = NULL WHERE guild_id = ?",
-                    (ctx.guild.id,)
-                )
+                conn.execute("UPDATE guild_settings SET log_channel = NULL WHERE guild_id = ?", (ctx.guild_id,))
             await ctx.send("✅ Log channel cleared.")
             return
-
-        if not isinstance(channel, discord.TextChannel):
+        try:
+            target = await ctx.convert(ChannelArg, channel)
+        except UserError:
             await ctx.send("❌ Usage: `?settings logchannel #channel` or `?settings logchannel off`")
             return
-
-        db.ensure_guild_settings(ctx.guild.id)
+        if target.type not in (0, 5):
+            await ctx.send("❌ The log channel must be a text channel.")
+            return
         with db.get_db() as conn:
-            conn.execute(
-                "UPDATE guild_settings SET log_channel = ? WHERE guild_id = ?",
-                (channel.id, ctx.guild.id)
-            )
-        await ctx.send(f"✅ Log channel set to {channel.mention}.")
-
-    async def cog_command_error(self, ctx, error):
-        if isinstance(error, commands.CheckFailure):
-            await ctx.send("You don't have permission to change settings.")
-        elif isinstance(error, commands.BadArgument):
-            await ctx.send(f"❌ {error}")
+            conn.execute("UPDATE guild_settings SET log_channel = ? WHERE guild_id = ?", (target.id, ctx.guild_id))
+        await ctx.send(f"✅ Log channel set to {target.mention}.")
 
 
 async def setup(bot):
